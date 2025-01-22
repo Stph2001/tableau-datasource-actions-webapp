@@ -1,9 +1,15 @@
+import streamlit as st
 import pandas as pd
 import xml.etree.ElementTree as ET
 import re
 import html
-import streamlit as st
 from io import BytesIO
+import zipfile
+import os
+
+# ------------------------- #
+# FUNCIONES EXISTENTES      #
+# ------------------------- #
 
 # Diccionario global para almacenar cálculos y sus captions
 calculation_pairs = {}
@@ -46,15 +52,13 @@ def get_table_name_for_column(root, column_name):
     return ''
 
 def process_tds_file(tds_file):
-    """Procesa el archivo TDS y devuelve un DataFrame con las columnas y sus características."""
+    """Procesa el contenido de un archivo TDS y devuelve un DataFrame con las columnas y sus características."""
     tree = ET.parse(tds_file)
     root = tree.getroot()
 
     data = []
-
     for column in root.findall('.//column'):
         caption = column.get('caption', '')
-
         if caption == '':
             continue
 
@@ -69,12 +73,14 @@ def process_tds_file(tds_file):
         calculation_pairs[name_in_snowflake] = caption
         calculation = column.find('calculation')
         transformed_formula = ''
+
         if calculation is not None:
-            if name_in_snowflake.find("(copia)") != -1 or name_in_snowflake.find("(copy)") != -1:
+            if "(copia)" in name_in_snowflake or "(copy)" in name_in_snowflake:
                 name_in_snowflake = "Calculado"
             if 'formula' in calculation.attrib:
                 transformed_formula = transform_formula(calculation.attrib['formula'])[:500]
             else:
+                # Manejo de bins (ejemplo con 'categorical-bin')
                 if calculation.get('class') == 'categorical-bin':
                     bins_descriptions = []
                     for bin_element in calculation.findall('bin'):
@@ -85,6 +91,7 @@ def process_tds_file(tds_file):
         # Obtener el nombre de la tabla
         table_name = get_table_name_for_column(root, '[' + name_in_snowflake + ']')[1:-1]
 
+        # Caso especial para 'tableau_internal_object_id'
         if re.search(r'__(tableau_internal_object_id__)][.]\[([^]]+)', name_in_snowflake):
             table_name = caption
             name_in_snowflake = 'tableau_internal_object_id'
@@ -98,36 +105,216 @@ def process_tds_file(tds_file):
             'Tabla': table_name,
             'Tipo de Dato': datatype
         }
-
         data.append(column_data)
 
     return pd.DataFrame(data)
 
-# Streamlit App
-st.title("Descarga de metadata de fuente de datos de Tableau")
+def process_tds_or_tdsx(file_obj):
+    """
+    Determina si el archivo es .tds o .tdsx.
+    Si es .tdsx, descomprime en memoria y procesa el .tds.
+    Si es .tds, lo procesa directamente.
+    """
+    filename = file_obj.name.lower()
+    
+    if filename.endswith(".tdsx"):
+        # Descomprimir y buscar .tds
+        with zipfile.ZipFile(file_obj, 'r') as z:
+            for name in z.namelist():
+                if name.endswith(".tds"):
+                    tds_data = z.read(name)
+                    return process_tds_file(BytesIO(tds_data))
+            raise ValueError("No se encontró ningún archivo .tds dentro del .tdsx.")
+    elif filename.endswith(".tds"):
+        return process_tds_file(file_obj)
+    else:
+        raise ValueError("El archivo no es un .tds o .tdsx válido.")
 
-st.write("Sube un archivo .tds para generar un Excel con las columnas y sus características.")
 
-uploaded_file = st.file_uploader("Subir archivo TDS", type="tds")
+# ------------------------- #
+# NUEVAS FUNCIONES          #
+# ------------------------- #
 
-if uploaded_file is not None:
-    if st.button("Procesar archivo"):
-        try:
-            # Procesar el archivo
-            df = process_tds_file(uploaded_file)
+def update_descriptions_in_tds(tds_content: bytes, df_descriptions: pd.DataFrame) -> bytes:
+    """
+    Actualiza las descripciones de las columnas en un archivo TDS (contenido binario).
+    Omite actualizaciones para descripciones vacías, '-'
+    o celdas con NaN.
+    """
+    tree = ET.parse(BytesIO(tds_content))
+    root = tree.getroot()
 
-            # Guardar el DataFrame en un archivo Excel
-            excel_buffer = BytesIO()
-            df.to_excel(excel_buffer, index=False)
-            excel_buffer.seek(0)
+    # Convertimos NaN a None o '' (según prefieras) antes de crear el dict
+    df_descriptions = df_descriptions.fillna('')
 
-            # Descargar el archivo
-            st.success("Archivo procesado con éxito.")
-            st.download_button(
-                label="Descargar Excel",
-                data=excel_buffer,
-                file_name="Columnas_Universos.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        except Exception as e:
-            st.error(f"Error al procesar el archivo: {e}")
+    # Creamos un diccionario: { Nombre : Descripción } a partir del DataFrame
+    desc_dict = dict(zip(df_descriptions['Nombre'], df_descriptions['Descripción']))
+    
+    for column in root.findall(".//column"):
+        caption = column.get('caption')
+        if not caption:
+            continue
+        
+        # Buscar la descripción en el dict
+        if caption in desc_dict:
+            new_description = desc_dict[caption]
+
+            # Validar para omitir '-'
+            if new_description == "-":
+                continue
+
+            # Validar NaN o string vacío (después de fillna se convierte en '', pero revisamos cualquier caso)
+            if not isinstance(new_description, str) or new_description.strip() == '':
+                continue
+
+            # Eliminar descripción existente si existe
+            desc_elem = column.find("desc")
+            if desc_elem is not None:
+                column.remove(desc_elem)
+
+            # Crear nueva descripción
+            new_desc = ET.Element("desc")
+            formatted_text = ET.SubElement(new_desc, "formatted-text")
+            run = ET.SubElement(formatted_text, "run")
+            run.text = new_description
+            column.append(new_desc)
+
+    # Guardar el árbol XML en un BytesIO
+    out_bytes = BytesIO()
+    tree.write(out_bytes, encoding="utf-8", xml_declaration=True)
+    out_bytes.seek(0)
+
+    return out_bytes.read()
+
+def update_tds_or_tdsx(file_obj, df_descriptions: pd.DataFrame) -> BytesIO:
+    """
+    Recibe un archivo .tds o .tdsx y el DataFrame con descripciones.
+    Actualiza las descripciones y devuelve el contenido binario de un nuevo archivo
+    (en formato TDS si era TDS, o TDSX si era TDSX).
+    """
+    filename = file_obj.name.lower()
+    if filename.endswith(".tdsx"):
+        # 1. Descomprimir todo en memoria
+        with zipfile.ZipFile(file_obj, 'r') as z_in:
+            # Leemos todos los archivos en un dict {nombre: bytes}
+            in_memory_files = {}
+            tds_file_name = None
+
+            for name in z_in.namelist():
+                in_memory_files[name] = z_in.read(name)
+                if name.endswith(".tds"):
+                    tds_file_name = name
+
+        if not tds_file_name:
+            raise ValueError("No se encontró ningún archivo .tds dentro del .tdsx para actualizar.")
+
+        # 2. Actualizar TDS
+        original_tds_content = in_memory_files[tds_file_name]
+        updated_tds_content = update_descriptions_in_tds(original_tds_content, df_descriptions)
+
+        # 3. Reemplazar el contenido del TDS en el dict
+        in_memory_files[tds_file_name] = updated_tds_content
+
+        # 4. Volver a crear el .tdsx en un BytesIO
+        out_tdsx = BytesIO()
+        with zipfile.ZipFile(out_tdsx, 'w', zipfile.ZIP_DEFLATED) as z_out:
+            for name, content in in_memory_files.items():
+                z_out.writestr(name, content)
+        out_tdsx.seek(0)
+        return out_tdsx
+
+    elif filename.endswith(".tds"):
+        # Directo sobre un TDS
+        tds_content = file_obj.read()
+        updated_content = update_descriptions_in_tds(tds_content, df_descriptions)
+
+        # Retornamos un BytesIO con el TDS actualizado
+        out_tds = BytesIO(updated_content)
+        out_tds.seek(0)
+        return out_tds
+
+    else:
+        raise ValueError("El archivo no es un .tds o .tdsx válido.")
+
+
+# --------------------------- #
+# APLICACIÓN STREAMLIT        #
+# --------------------------- #
+
+st.title("Asistente de Metadata para Datasources de Tableau")
+
+modo = st.selectbox(
+    "Elige la acción a realizar:",
+    ["Exportar metadata a Excel", "Actualizar descripciones en TDS/TDSX"]
+)
+
+if modo == "Exportar metadata a Excel":
+    st.write("Sube un archivo .tds o .tdsx para generar un Excel con las columnas y sus características.")
+    uploaded_file = st.file_uploader("Subir archivo TDS o TDSX", type=["tds", "tdsx"])
+
+    if uploaded_file is not None:
+        if st.button("Procesar archivo y generar Excel"):
+            try:
+                df = process_tds_or_tdsx(uploaded_file)
+
+                # Guardar el DataFrame en un archivo Excel en memoria
+                excel_buffer = BytesIO()
+                df.to_excel(excel_buffer, index=False)
+                excel_buffer.seek(0)
+
+                st.success("Archivo procesado con éxito.")
+                st.download_button(
+                    label="Descargar Excel",
+                    data=excel_buffer,
+                    file_name="Metadata_Tableau.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            except Exception as e:
+                st.error(f"Error al procesar el archivo: {e}")
+
+elif modo == "Actualizar descripciones en TDS/TDSX":
+    st.write("Sube un archivo .tds o .tdsx y un Excel con columnas [Nombre, Descripción].")
+    
+    st.markdown("### Ejemplo de Formato de Excel")
+    st.write(
+        """Asegúrate de que tu archivo Excel contenga **al menos** las columnas:
+        **"Nombre"** y **"Descripción"**."""
+    )
+    
+    # Mostrar tabla de ejemplo
+    df_example = pd.DataFrame({
+        "Nombre": ["ID_Cliente", "Nombre_Cliente", "Fecha_Alta", "Monto_Pago"],
+        "Descripción": [
+            "Identificador único de cada cliente.",
+            "Nombre completo del cliente.",
+            "Fecha en la que se dio de alta al cliente.",
+            "Cantidad abonada por el cliente en su última transacción."
+        ]
+    })
+    st.table(df_example)
+
+    uploaded_tds = st.file_uploader("Subir archivo TDS o TDSX", type=["tds", "tdsx"])
+    uploaded_excel = st.file_uploader("Subir archivo Excel con descripciones", type=["xlsx", "xls"])
+
+    if uploaded_tds is not None and uploaded_excel is not None:
+        if st.button("Actualizar Descripciones"):
+            try:
+                # 1. Leer el Excel para obtener el DataFrame con [Nombre, Descripción]
+                df_desc = pd.read_excel(uploaded_excel)
+
+                # 2. Actualizar descripciones en el TDS/TDSX
+                updated_file_bytesio = update_tds_or_tdsx(uploaded_tds, df_desc)
+
+                # 3. Preparar nombre de archivo resultante
+                original_filename = uploaded_tds.name
+                updated_filename = "Actualizado_" + original_filename
+
+                st.success("Descripciones actualizadas con éxito.")
+                st.download_button(
+                    label="Descargar TDS/TDSX Actualizado",
+                    data=updated_file_bytesio.getvalue(),
+                    file_name=updated_filename,
+                    mime="application/octet-stream"
+                )
+            except Exception as e:
+                st.error(f"Error al actualizar descripciones: {e}")
