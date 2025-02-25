@@ -5,7 +5,8 @@ import re
 import html
 from io import BytesIO
 import zipfile
-import os
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill
 
 # ------------------------- #
 # FUNCIONES EXISTENTES      #
@@ -129,6 +130,90 @@ def process_tds_or_tdsx(file_obj):
         return process_tds_file(file_obj)
     else:
         raise ValueError("El archivo no es un .tds o .tdsx válido.")
+    
+def compare_data_sources(df_old, df_new):
+    """
+    Compara dos versiones de la misma fuente de datos y devuelve un DataFrame con los cambios:
+    - 'Nuevo' para campos agregados en la nueva versión.
+    - 'Eliminado' para campos que estaban en la versión anterior pero no en la nueva.
+    - 'Modificado' para campos que han cambiado su descripción o fórmula.
+    """
+    old_fields = set(df_old['Nombre'])
+    new_fields = set(df_new['Nombre'])
+
+    added_fields = new_fields - old_fields
+    removed_fields = old_fields - new_fields
+    common_fields = old_fields & new_fields
+
+    changes = []
+
+    for field in added_fields:
+        row = df_new[df_new['Nombre'] == field].iloc[0]
+        row_data = row.to_dict()
+        row_data['Cambio'] = 'Nuevo'
+        changes.append(row_data)
+
+    for field in removed_fields:
+        row = df_old[df_old['Nombre'] == field].iloc[0]
+        row_data = row.to_dict()
+        row_data['Cambio'] = 'Eliminado'
+        changes.append(row_data)
+
+    for field in common_fields:
+        old_row = df_old[df_old['Nombre'] == field].iloc[0]
+        new_row = df_new[df_new['Nombre'] == field].iloc[0]
+
+    if (old_row["Descripción"] != new_row["Descripción"]) or (old_row["Fórmula"] != new_row["Fórmula"]) or (old_row["Oculto"] != new_row["Oculto"]):
+        row_data = new_row.to_dict()
+        row_data["Cambio"] = "Modificado"
+        changes.append(row_data)
+
+    return pd.DataFrame(changes) 
+
+def save_comparison_excel(df):
+    """
+    Guarda la comparación en un archivo Excel con colores según el tipo de cambio.
+    - Rojo para "Eliminado"
+    - Naranja para "Modificado"
+    - Verde para "Nuevo"
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Comparación Metadata"
+
+    # Escribir encabezados con formato en negrita
+    headers = list(df.columns)
+    ws.append(headers)
+
+    # Definir colores
+    fill_deleted = PatternFill(start_color="FF9999", end_color="FF9999", fill_type="solid")  # Rojo
+    fill_modified = PatternFill(start_color="FFD966", end_color="FFD966", fill_type="solid")  # Naranja
+    fill_new = PatternFill(start_color="C6E0B4", end_color="C6E0B4", fill_type="solid")  # Verde
+
+    # Agregar filas con colores según el tipo de cambio
+    for row in df.itertuples(index=False):
+        row_data = list(row)
+        ws.append(row_data)
+
+        # Aplicar color según el valor en la última columna ("Cambio")
+        change_type = row.Cambio
+        fill = None
+        if change_type == "Eliminado":
+            fill = fill_deleted
+        elif change_type == "Modificado":
+            fill = fill_modified
+        elif change_type == "Nuevo":
+            fill = fill_new
+
+        if fill:
+            for col_idx in range(1, len(row_data) + 1):
+                ws.cell(row=ws.max_row, column=col_idx).fill = fill
+
+    # Guardar en un buffer de memoria
+    excel_buffer = BytesIO()
+    wb.save(excel_buffer)
+    excel_buffer.seek(0)
+    return excel_buffer
 
 
 # ------------------------- #
@@ -245,7 +330,7 @@ st.title("Asistente de Metadata para Datasources de Tableau")
 
 modo = st.selectbox(
     "Elige la acción a realizar:",
-    ["Exportar metadata a Excel", "Actualizar descripciones en TDS/TDSX"]
+    ["Exportar metadata a Excel", "Actualizar descripciones en el datasource", "Comparar versiones de datasources"]
 )
 
 if modo == "Exportar metadata a Excel":
@@ -272,7 +357,7 @@ if modo == "Exportar metadata a Excel":
             except Exception as e:
                 st.error(f"Error al procesar el archivo: {e}")
 
-elif modo == "Actualizar descripciones en TDS/TDSX":
+elif modo == "Actualizar descripciones en el datasource":
     st.write("Sube un archivo .tds o .tdsx y un Excel con columnas [Nombre, Descripción].")
     
     st.markdown("### Ejemplo de Formato de Excel")
@@ -318,3 +403,34 @@ elif modo == "Actualizar descripciones en TDS/TDSX":
                 )
             except Exception as e:
                 st.error(f"Error al actualizar descripciones: {e}")
+
+elif modo == "Comparar versiones de datasources":
+    st.write("Sube dos archivos .tds o .tdsx para comparar las columnas y sus características.")
+    uploaded_file1 = st.file_uploader("Subir versión anterior (.tds o .tdsx)", type=["tds", "tdsx"])
+    uploaded_file2 = st.file_uploader("Subir versión nueva (.tds o .tdsx)", type=["tds", "tdsx"])
+
+    if uploaded_file1 and uploaded_file2:
+        if st.button("Comparar archivos"):
+            try:
+                df_old = process_tds_or_tdsx(uploaded_file1)
+                df_new = process_tds_or_tdsx(uploaded_file2)
+
+                df_changes = compare_data_sources(df_old, df_new)
+
+                if df_changes.empty:
+                    st.success("No se encontraron cambios entre las versiones.")
+
+                else:
+                    st.success("Comparación completada. Descarga el archivo Excel con los cambios.")
+
+                    excel_buffer = save_comparison_excel(df_changes)
+
+                    st.download_button(
+                        label="Descargar Excel con cambios",
+                        data=excel_buffer,
+                        file_name="Comparacion_Metadata.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+
+            except Exception as e:
+                st.error(f"Error al comparar los archivos: {e}")
